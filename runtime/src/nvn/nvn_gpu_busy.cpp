@@ -1,0 +1,133 @@
+// The GPU's busy time per frame at the real load (NX_GPU_PROFILE=3; docs/nvn/android-perf/PHASE4.md G0). The per-pass
+// profile (NX_GPU_PROFILE=1, nvn_debug.cpp) waits for every submit, so the GPU idles between frames and its clock
+// drops: it measured a slower GPU than the game runs on. Here each queued part of a submit or present gets a timestamp
+// at its start and its end in its slot's own query pool, and the results are read when the slot is retired (its
+// fences passed: no wait). Logged every 60 presents: busy = the parts' summed lengths, span = first start to last
+// end of each slot, and the GPU clock from sysfs when readable.
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
+#include <string>
+#include <vector>
+
+#include "nvn_vk.h"
+
+namespace nx::nvn {
+
+using namespace nx::vk;
+
+namespace {
+
+constexpr uint32_t kSlots = 8, kParts = 64;
+VkQueryPool g_pools[kSlots] = {};
+double g_period_ns = 1.0;
+double g_busy_ns = 0, g_span_ns = 0;
+uint64_t g_parts = 0, g_not_ready = 0;
+// Each part's label: the first render pass begun in it (gpu_busy_note_pass), and the GPU time per label. With
+// NX_SUBMIT_CHUNK_DRAWS=<n> a submit is cut every n draws, so the labels say where the GPU's time goes.
+std::string g_labels[kSlots][kParts];
+uint32_t g_cur_slot = UINT32_MAX, g_cur_part = 0;
+std::map<std::string, double> g_by_label;
+
+uint64_t read_sysfs(const char* path) {
+    FILE* f = std::fopen(path, "r");
+    if (!f) return 0;
+    unsigned long long v = 0;
+    if (std::fscanf(f, "%llu", &v) != 1) v = 0;
+    std::fclose(f);
+    return v;
+}
+
+}  // namespace
+
+bool gpu_busy_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("NX_GPU_PROFILE");
+        return e && std::atoi(e) == 3;
+    }();
+    return on;
+}
+
+void gpu_busy_part_begin(uint32_t slot, uint32_t part, VkCommandBuffer cb) {
+    if (!gpu_busy_on() || slot >= kSlots || part >= kParts) return;
+    if (!g_pools[slot]) {
+        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = 2 * kParts;
+        p_vkCreateQueryPool(vk_device(), &qi, nullptr, &g_pools[slot]);
+        static bool once = false;
+        if (!once) {
+            once = true;
+            VkPhysicalDeviceProperties props{};
+            p_vkGetPhysicalDeviceProperties(vk_physical(), &props);
+            g_period_ns = props.limits.timestampPeriod;
+            log("gpu busy: timestamps on (NX_GPU_PROFILE=3), period %.2f ns", g_period_ns);
+        }
+    }
+    g_labels[slot][part].clear(), g_cur_slot = slot, g_cur_part = part;
+    p_vkCmdResetQueryPool(cb, g_pools[slot], 2 * part, 2);
+    p_vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_pools[slot], 2 * part);
+}
+
+void gpu_busy_part_end(uint32_t slot, uint32_t part, VkCommandBuffer cb) {
+    if (!gpu_busy_on() || slot >= kSlots || part >= kParts || !g_pools[slot]) return;
+    p_vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_pools[slot], 2 * part + 1);
+}
+
+void gpu_busy_retired(uint32_t slot, uint64_t queued) {
+    if (!gpu_busy_on() || slot >= kSlots || !g_pools[slot] || !queued) return;
+    uint64_t first = UINT64_MAX, last = 0;
+    double busy = 0;
+    for (uint32_t p = 0; p < kParts; p++) {
+        if (!(queued >> p & 1)) continue;
+        uint64_t t[2] = {};
+        if (p_vkGetQueryPoolResults(vk_device(), g_pools[slot], 2 * p, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) !=
+            VK_SUCCESS) {
+            g_not_ready++;
+            continue;
+        }
+        if (t[1] < t[0]) continue;
+        g_busy_ns += double(t[1] - t[0]) * g_period_ns, g_parts++, busy += double(t[1] - t[0]) * g_period_ns;
+        g_by_label[g_labels[slot][p].empty() ? "(no pass)" : g_labels[slot][p]] += double(t[1] - t[0]) * g_period_ns;
+        first = std::min(first, t[0]), last = std::max(last, t[1]);
+    }
+    if (last > first) g_span_ns += double(last - first) * g_period_ns;
+    // A slot whose GPU work alone passes 32 ms: the frame cannot be shown on time at 30 fps.
+    static uint64_t prev_first = 0;
+    static int slow = 0;
+    if (busy > 32e6 && slow++ < 200)
+        log("gpu slow slot: busy %.1f ms, span %.1f ms, %.1f ms after the previous slot's start", busy / 1e6,
+            double(last - first) * g_period_ns / 1e6, prev_first ? double(first - prev_first) * g_period_ns / 1e6 : 0.0);
+    if (first != UINT64_MAX) prev_first = first;
+}
+
+void gpu_busy_log(uint64_t frames) {
+    if (!gpu_busy_on() || !frames) return;
+    uint64_t clk = read_sysfs("/sys/class/kgsl/kgsl-3d0/gpuclk");
+    uint64_t busy_pct = read_sysfs("/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage");
+    log("gpu busy: %.2f ms/frame (%.1f parts/frame), span %.2f ms/frame, %llu not ready; clock %llu MHz, busy %llu%%",
+        g_busy_ns / 1e6 / double(frames), double(g_parts) / double(frames), g_span_ns / 1e6 / double(frames),
+        (unsigned long long)g_not_ready, (unsigned long long)(clk / 1000000), (unsigned long long)busy_pct);
+    g_busy_ns = g_span_ns = 0, g_parts = g_not_ready = 0;
+    static uint64_t logs = 0;
+    if (++logs % 5 == 0 && g_by_label.size() > 1) {
+        std::vector<std::pair<double, std::string>> v;
+        for (auto& [label, ns] : g_by_label) v.push_back({ns, label});
+        std::sort(v.rbegin(), v.rend());
+        double total = 0;
+        for (auto& e : v) total += e.first;
+        for (size_t k = 0; k < v.size() && k < 30; k++)
+            log("gpu busy by part: %6.2f ms/frame %5.1f%%  %s", v[k].first / 1e6 / double(frames * 5),
+                100.0 * v[k].first / total, v[k].second.c_str());
+        g_by_label.clear();
+    }
+}
+
+void gpu_busy_note_pass(const char* label) {
+    if (!gpu_busy_on() || g_cur_slot >= kSlots) return;
+    std::string& l = g_labels[g_cur_slot][g_cur_part];
+    if (l.empty()) l = label;
+}
+
+}  // namespace nx::nvn

@@ -1,0 +1,80 @@
+#include "tld/platform.h"
+
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>  // not pulled in by SDL.h
+
+#include <cstdio>
+
+namespace tld {
+namespace {
+
+// SDL3 loads the Vulkan loader itself, so the runtime needs no link-time dependency on
+// libvulkan: on a machine without one the game still starts and says so.
+bool probe_vulkan(std::string& note) {
+    if (!SDL_Vulkan_LoadLibrary(nullptr)) {
+        note = std::string("no Vulkan loader: ") + SDL_GetError();
+        return false;
+    }
+    Uint32 count = 0;
+    char const* const* names = SDL_Vulkan_GetInstanceExtensions(&count);
+    if (!names || count == 0) {
+        note = "Vulkan loader present but reported no instance extensions";
+        return false;
+    }
+    note = std::string("Vulkan loader OK, ") + std::to_string(count) +
+           " instance extension(s) available";
+    return true;
+}
+
+}  // namespace
+
+Platform probe() {
+    Platform p;
+    if (!SDL_Init(SDL_INIT_VIDEO)) {
+        p.video_driver = std::string("unavailable: ") + SDL_GetError();
+    } else {
+        const char* drv = SDL_GetCurrentVideoDriver();
+        p.video_ready = drv != nullptr;
+        p.video_driver = drv ? drv : "none";
+    }
+    p.vulkan_ready = probe_vulkan(p.vulkan_note);
+    return p;
+}
+
+bool run_window(const std::string& title, int width, int height, int frames) {
+    if (!SDL_Init(SDL_INIT_VIDEO)) {
+        std::fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
+        return false;
+    }
+    SDL_Window* win = SDL_CreateWindow(title.c_str(), width, height, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+    if (!win) {
+        std::fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
+        SDL_Quit();
+        return false;
+    }
+    std::printf("window: %dx%d on %s\n", width, height, SDL_GetCurrentVideoDriver());
+
+    // Placeholder frame: until the NVN -> Vulkan presenter exists, the window shows the
+    // runtime's clear colour so the event loop and the platform layer can be verified.
+    bool running = true;
+    int drawn = 0;
+    while (running && (frames <= 0 || drawn < frames)) {
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_EVENT_QUIT) running = false;
+            if (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_ESCAPE) running = false;
+        }
+        if (SDL_Surface* s = SDL_GetWindowSurface(win)) {
+            const SDL_Rect all{0, 0, s->w, s->h};
+            SDL_FillSurfaceRect(s, &all, SDL_MapSurfaceRGB(s, 0x0B, 0x1F, 0x2E));
+            SDL_UpdateWindowSurface(win);
+        }
+        SDL_Delay(16);
+        ++drawn;
+    }
+    SDL_DestroyWindow(win);
+    SDL_Quit();
+    return true;
+}
+
+}  // namespace tld

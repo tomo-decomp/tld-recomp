@@ -1,0 +1,74 @@
+#!/bin/bash
+# Copies the game's data to the phone connected by adb: to the app's folder on the memory card when there is one
+# (the runtime looks there, platform_android.cpp), else on the phone's own storage. The RomFS goes as one packed
+# file (tools/pack_romfs.py) sent in parts of 1 GiB and appended on the phone, so an interrupted copy resumes where
+# it stopped (adb exec-in streams stalled after a few GB) and the Mac needs only 1 GiB free for it.
+#
+# usage: tools/push_android.sh [--skip-romfs]
+cd "$(dirname "$0")/.." || exit 1
+set -e
+GAME=tld
+PKG=io.github.tldrecomp
+SRC=private/$GAME
+PART=1073741824
+card=$(adb shell 'for d in /storage/*; do case $d in */emulated|*/self) ;; *) echo $d; break;; esac; done' | tr -d '\r')
+D=${card:-/sdcard}/Android/data/$PKG/files
+echo "== data folder on the phone: $D"
+adb shell mkdir -p "$D"
+
+# What the runtime reads (not shaders_extracted: an intermediate of the setup). A folder already there with as many
+# files and bytes is skipped: thousands of small files take minutes each time.
+for d in analysis spirv fonts exefs mods aoc; do
+  [ -e "$SRC/$d" ] || continue
+  # Files and bytes: an updated translation has the same files with other contents.
+  local_n=$(find -L "$SRC/$d" -type f | wc -l | tr -d ' ')
+  local_b=$(find -L "$SRC/$d" -type f -exec stat -f %z {} + 2>/dev/null || find -L "$SRC/$d" -type f -exec stat -c %s {} +)
+  local_b=$(echo "$local_b" | awk '{s += $1} END {print s + 0}')
+  phone_n=$(adb shell "find $D/$d -type f 2>/dev/null | wc -l" | tr -d '\r ')
+  phone_b=$(adb shell "find $D/$d -type f -exec stat -c %s {} + 2>/dev/null" | tr -d '\r' | awk '{s += $1} END {print s + 0}')
+  if [ "$local_n" = "$phone_n" ] && [ "$local_b" = "$phone_b" ]; then echo "== $d: already there ($local_n files)"; continue; fi
+  echo "== $d ($local_n files)"
+  adb push "$SRC/$d" "$D/" | tail -1
+done
+# The shaders also as one file (tools/pack_spirv.py): opening each .spv on the phone's shared storage took
+# milliseconds. Re-sent when the folder changed.
+if [ -d "$SRC/spirv" ]; then
+  python3 tools/pack_spirv.py "$SRC/spirv" "$SRC/spirv.pak"
+  local_s=$(stat -f %z "$SRC/spirv.pak" 2>/dev/null || stat -c %s "$SRC/spirv.pak")
+  phone_s=$(adb shell "stat -c %s $D/spirv.pak 2>/dev/null || echo 0" | tr -d '\r')
+  if [ "$local_s" != "$phone_s" ]; then adb push "$SRC/spirv.pak" "$D/" | tail -1; else echo "== spirv.pak: already there"; fi
+fi
+# The game's recompiled code (tools/build_android.sh): the app loads it from this folder.
+LIB=private/$GAME/apk/lib${GAME}_game.so
+[ -f "$LIB" ] || { echo "no $LIB: tools/build_android.sh first"; exit 1; }
+local_s=$(stat -f %z "$LIB" 2>/dev/null || stat -c %s "$LIB")
+phone_s=$(adb shell "stat -c %s $D/lib${GAME}_game.so 2>/dev/null || echo 0" | tr -d '\r')
+if [ "$local_s" != "$phone_s" ] || [ "$LIB" -nt private/$GAME/apk/.pushed ]; then
+  adb push "$LIB" "$D/" | tail -1 && touch private/$GAME/apk/.pushed
+else
+  echo "== lib${GAME}_game.so: already there"
+fi
+# The computer's settings only for a first copy: the phone's own (its settings screen) are kept.
+for f in config.ini language.txt users.txt; do
+  [ -f "$SRC/$f" ] || continue
+  if [ "$(adb shell "[ -f $D/$f ] && echo y" | tr -d '\r')" = y ]; then echo "== $f: the phone's own kept"; continue; fi
+  adb push "$SRC/$f" "$D/" | tail -1
+done
+
+[ "$1" = --skip-romfs ] && exit 0
+total=$(python3 tools/pack_romfs.py "$SRC/extract/romfs" --size)
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+while :; do
+  have=$(adb shell "stat -c %s $D/romfs.pak 2>/dev/null || echo 0" | tr -d '\r')
+  [ "$have" -ge "$total" ] && break
+  to=$((have + PART))
+  echo "== romfs.pak: $((have >> 20)) of $((total >> 20)) MiB"
+  python3 tools/pack_romfs.py "$SRC/extract/romfs" "$tmp/part" --from "$have" --to "$to" 2>/dev/null
+  adb push "$tmp/part" "$D/romfs.part" | tail -1
+  adb shell "cat $D/romfs.part >> $D/romfs.pak && rm $D/romfs.part"
+done
+[ "$have" -eq "$total" ] || { echo "romfs.pak is $have bytes, expected $total"; exit 1; }
+echo "== romfs.pak complete ($((total >> 20)) MiB)"
+# The loose RomFS of an older copy is no longer read: it only took space.
+adb shell "rm -rf $D/extract" && echo "== removed the loose extract/romfs"

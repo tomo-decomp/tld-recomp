@@ -1,0 +1,3 @@
+# Instructions of main (1.0.4) that call the runtime first (recomp --hooks; games/tld/*.cpp).
+# One module-relative instruction address per line, '#' comments. Empty until a fix needs one: a hook is only
+# meaningful at the address of the build it was found in, which is why the list is named by build id in versions.txt.

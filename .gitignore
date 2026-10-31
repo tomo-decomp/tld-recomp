@@ -1,0 +1,11 @@
+# Nothing derived from the game is ever committed: the dump, the generated code and the
+# build are all produced locally from the user's own copy.
+private/
+build/
+build-*/
+deps/
+__pycache__/
+*.pyc
+*.part
+*.elf
+*.nso

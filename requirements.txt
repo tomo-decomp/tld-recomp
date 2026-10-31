@@ -1,0 +1,4 @@
+# Python packages the tools need. Every one has a wheel for Linux, macOS and Windows.
+pycryptodome==3.23.0
+lz4==4.4.5
+zstandard==0.25.0

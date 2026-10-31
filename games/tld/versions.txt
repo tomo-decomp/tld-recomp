@@ -1,0 +1,7 @@
+# The versions of Tomodachi Life: Living the Dream whose main the project knows, by build id (the first 16 bytes of
+# main's ModuleId, NSO header 0x40; tools/tld_version.py prints it). Each line: build id, version, the hooks of main
+# for that build (instructions that call the runtime first: games/tld/*.cpp), "-" for none.
+#
+# Any other version is imported, recompiled and built all the same, with no hooks: the game runs as dumped.
+# docs/VERSIONS.md says how to port a fix to another build and add its line here.
+b39fef373fb12154385d012aab3bc99e  1.0.4  -
